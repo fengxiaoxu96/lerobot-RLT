@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from lerobot.configs import PipelineFeatureType, PolicyFeature
+from lerobot.lerobot_types import EnvTransition, TransitionKey
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     ActionTokenizerProcessorStep,
@@ -34,7 +35,6 @@ from lerobot.processor import (
     make_default_policy_processor_steps,
     make_policy_processor_pipelines,
 )
-from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import OBS_STATE
 
 from .configuration_pi0_fast import PI0FastConfig
@@ -53,10 +53,14 @@ class Pi0FastPrepareStateAndLanguageTokenizerProcessorStep(ProcessorStep):
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
 
-        state = transition.get(TransitionKey.OBSERVATION, {}).get(OBS_STATE)
+        observation = transition.get(TransitionKey.OBSERVATION)
+        state = observation.get(OBS_STATE) if observation is not None else None
         if state is None:
             raise ValueError("State is required for PI0Fast")
-        tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key)
+        complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA)
+        if complementary_data is None:
+            raise ValueError("Complementary data is required for PI0Fast")
+        tasks = complementary_data.get(self.task_key)
         if tasks is None:
             raise ValueError("No task found in complementary data")
 
@@ -75,7 +79,7 @@ class Pi0FastPrepareStateAndLanguageTokenizerProcessorStep(ProcessorStep):
             full_prompt = f"Task: {cleaned_text}, State: {state_str};\n"
             full_prompts.append(full_prompt)
 
-        transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = full_prompts
+        complementary_data[self.task_key] = full_prompts
         # Normalize state to [-1, 1] range if needed (assuming it's already normalized by normalizer processor step!!)
         # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
         return transition

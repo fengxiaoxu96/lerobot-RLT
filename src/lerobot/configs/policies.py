@@ -38,7 +38,7 @@ logger = getLogger(__name__)
 
 
 @dataclass
-class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: ignore[misc,name-defined] #TODO: draccus issue
+class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     """
     Base configuration class for policy models.
 
@@ -67,7 +67,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     # Whether the policy employed PEFT for training.
     use_peft: bool = False
 
-    push_to_hub: bool = True  # type: ignore[assignment] # TODO: use a different name to avoid override
+    push_to_hub: bool = True  # TODO: rename; shadows HubMixin.push_to_hub()
     repo_id: str | None = None
 
     # Upload on private repository on the Hugging Face hub.
@@ -104,17 +104,17 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
 
     @property
     @abc.abstractmethod
-    def observation_delta_indices(self) -> list | None:  # type: ignore[type-arg] #TODO: No implementation
+    def observation_delta_indices(self) -> list[int] | None:
         raise NotImplementedError
 
     @property
     @abc.abstractmethod
-    def action_delta_indices(self) -> list | None:  # type: ignore[type-arg]    #TODO: No implementation
+    def action_delta_indices(self) -> list[int] | None:
         raise NotImplementedError
 
     @property
     @abc.abstractmethod
-    def reward_delta_indices(self) -> list | None:  # type: ignore[type-arg]    #TODO: No implementation
+    def reward_delta_indices(self) -> list[int] | None:
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -163,8 +163,10 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         return None
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        with open(save_directory / CONFIG_NAME, "w") as f, draccus.config_type("json"):
-            draccus.dump(self, f, indent=4)
+        # Encode against the base class so draccus includes the choice "type" key,
+        # which `from_pretrained` needs to resolve the concrete subclass.
+        with open(save_directory / CONFIG_NAME, "w") as f:
+            json.dump(draccus.encode(self, PreTrainedConfig), f, indent=4)
 
     @classmethod
     def from_pretrained(
