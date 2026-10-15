@@ -17,10 +17,10 @@ Reference source: [openpi-RLT framework](../openpi-RLT/RLToken_Framework.md)
 | 1 | `rl/rltoken/config.py` | Done |
 | 1 | `rl/rltoken/action_representation.py` | Pending |
 | 2 | `policies/rltoken/rl_token.py` | Done |
-| 2 | `policies/rltoken/configuration_rltoken.py` | Pending |
-| 3 | `policies/pi05_rlt/modeling_pi05_rlt.py` | Pending |
-| 4 | `policies/rltoken/modeling_rltoken.py` | Pending |
-| 4 | `scripts/train_rlt.py` | Pending |
+| 2 | `policies/rltoken/configuration_rltoken.py` | Done |
+| 3 | `policies/pi05_rlt/modeling_pi05_rlt.py` | Done |
+| 4 | `policies/rltoken/modeling_rltoken.py` | Done |
+| 4 | `scripts/train_rlt.py` | Done |
 | 5 | `rl/rltoken/networks.py` | Pending |
 | 6 | `rl/rltoken/replay.py` | Pending |
 | 7 | `rl/rltoken/trainer.py` | Pending |
@@ -356,5 +356,331 @@ memory usage if needed.
 `RLTokenConfig` in this file is a plain `@dataclass(frozen=True)`.  The draccus
 policy config in `configuration_rltoken.py` is named `RLTokenPolicyConfig` to
 avoid an import-time clash when both are used in `modeling_rltoken.py`.
+
+---
+
+## Step 2 — `policies/rltoken/configuration_rltoken.py`
+
+**File:** [src/lerobot/policies/rltoken/configuration_rltoken.py](src/lerobot/policies/rltoken/configuration_rltoken.py)
+
+### Purpose
+
+draccus-registered policy config for **Stage 1** (offline RLToken training).  Acts as the
+single source of truth for all hyperparameters that `RLTokenPolicy` (in `modeling_rltoken.py`)
+and `train_rlt.py` consume.  Inherits `PreTrainedConfig` (`draccus.ChoiceRegistry` +
+`HubMixin`) so it can be serialised / pushed to the Hub exactly like any other lerobot policy.
+
+### Public API
+
+#### `RLTokenPolicyConfig` (registered as `"rltoken"`)
+
+| Group | Fields |
+|-------|--------|
+| VLA backbone | `pi05_pretrained_path`, `alpha`, `image_only_prefix` |
+| RLToken architecture | `num_rl_tokens`, `num_layers`, `embed_dim`, `input_dim`, `num_heads`, `mlp_ratio`, `dropout_rate`, `max_seq_len` |
+| Action / obs space | `action_dim`, `action_horizon`, `chunk_len`, `image_resolution` |
+| Normalization | `normalization_mapping` (VISUAL=IDENTITY, STATE/ACTION=QUANTILES) |
+| Optimizer | `optimizer_lr/betas/eps/weight_decay/grad_clip_norm` |
+| Scheduler | `scheduler_warmup_steps`, `scheduler_decay_steps`, `scheduler_decay_lr` |
+
+`alpha` controls the VLA gradient contribution:
+- `alpha = 0.0` — VLA is frozen; only RLToken parameters receive gradients.
+- `0 < alpha <= 1.0` — joint training; VLA loss is added at weight `alpha`.
+
+`max_seq_len` mirrors the field added to `RLTokenConfig` in `rl_token.py` to pre-allocate
+fixed-size positional encodings.  Both must be kept in sync; the policy copies this value when
+constructing `RLTokenModel`.
+
+#### `get_optimizer_preset()` / `get_scheduler_preset()`
+
+Return `AdamWConfig` and `CosineDecayWithWarmupSchedulerConfig` instances ready for
+`make_optimizer_and_scheduler()` in lerobot's training utilities.
+
+#### `validate_features()`
+
+Checks that at least one `VISUAL` input feature is present (Stage 1 requires images),
+then inserts default `OBS_STATE` and `ACTION` features if the dataset did not provide them.
+
+#### `action_delta_indices`
+
+Returns `list(range(action_horizon))` — signals to `DataProcessorPipeline` that all
+`action_horizon` steps are available as chunk targets, matching pi0.5 convention.
+
+### Naming note
+
+The class is `RLTokenPolicyConfig` (not `RLTokenConfig`) to avoid a name clash with
+the plain architecture dataclass `RLTokenConfig` defined in `rl_token.py`.  Both live
+in `modeling_rltoken.py` imports; keeping separate names prevents an attribute-override
+collision at draccus registration time.
+
+### Design choices vs openpi-RLT
+
+| Aspect | openpi-RLT | lerobot-RLT |
+|--------|-----------|-------------|
+| Config format | Python dataclass, no registration | draccus `ChoiceRegistry` (`"rltoken"` key) |
+| VLA path | Hardcoded or env var | `pi05_pretrained_path` field |
+| Normalization | Handled by pipeline step outside config | `normalization_mapping` inside config |
+| Optimizer | Configured separately in train script | `get_optimizer_preset()` / `get_scheduler_preset()` |
+| Image resolution | Fixed 224×224 in preprocessing | `image_resolution` field (default 224×224) |
+
+---
+
+## Step 3 — `policies/pi05_rlt/modeling_pi05_rlt.py`
+
+**File:** [src/lerobot/policies/pi05_rlt/modeling_pi05_rlt.py](src/lerobot/policies/pi05_rlt/modeling_pi05_rlt.py)
+
+### Purpose
+
+Subclasses `PI05Policy` to add two new forward-pass methods that expose the VLA's internal
+prefix embeddings.  These are the only new entry points; all existing behaviour is
+inherited unchanged.  No existing files are touched.
+
+`RLTokenPolicy` (in `modeling_rltoken.py`) holds an instance of this class as `self.vla`
+and calls one of the two methods depending on `RLTokenPolicyConfig.alpha`:
+
+| `alpha` | Called method |
+|---------|---------------|
+| 0 (VLA frozen) | `extract_prefix_embeddings` |
+| > 0 (joint training) | `compute_loss_with_prefix` |
+
+### Public API
+
+#### `extract_prefix_embeddings(batch, image_only=True) -> (prefix_embs, prefix_mask)`
+
+| Arg | Shape | Notes |
+|-----|-------|-------|
+| `prefix_embs` | `[B, seq_len, 2048]` | float32 / bfloat16 (matches VLA dtype) |
+| `prefix_mask` | `[B, seq_len]` | True = valid token |
+
+Implementation:
+1. Calls `self._preprocess_images(batch)` (inherited from `PI05Policy`).
+2. Calls `self.model._embed_images(images, img_masks)` — this respects both the
+   per-camera gradient-checkpointing path (training) and the fused batched path
+   (inference), exactly as `PI05Pytorch.embed_prefix` does.
+3. For each camera: stacks `[B, n_tok, hidden]` embedding + `[B, n_tok]` validity mask.
+4. If `image_only=False`, appends language token embeddings (via
+   `embed_language_tokens`) and the batch attention mask.
+5. Returns concatenated tensors.
+
+`image_only=True` is the default because `z_rl` is meant to compress the visual
+state; language tokens are conditioning context, not state.
+
+#### `compute_loss_with_prefix(batch, image_only=True) -> (vla_loss, prefix_embs, prefix_mask)`
+
+1. Calls `super().forward(batch)` — runs the full VLA flow-matching forward with
+   gradients flowing through VLA parameters.  Returns scalar `vla_loss`.
+2. Calls `extract_prefix_embeddings` under `torch.no_grad` to obtain detached prefix
+   embeddings for the RLToken encoder.
+
+The two-pass design (vision tower called twice) is intentional:
+
+- **Correctness**: VLA gradients must flow through the first pass (flow-matching loss).
+  The second pass needs no gradients because the caller always calls
+  `prefix_embs.detach()` before feeding to `RLTokenModel.loss()`.
+- **Efficiency**: The double-vision-tower cost only applies when `alpha > 0` (joint
+  training, rare configuration).  When `alpha = 0`, `extract_prefix_embeddings` is
+  called directly (single pass, `no_grad`).
+- **Simplicity**: Avoids inlining `PI05Pytorch.forward()` logic, keeping the subclass
+  minimal and not fragile against parent changes.
+
+### Why subclass `PI05Policy` (not `PI05Pytorch`)?
+
+`PI05Policy` provides the full preprocessing pipeline: `_preprocess_images()`,
+`_prepare_memory_states()`, `prepare_action()`, and `super().forward()`.  Accessing
+these directly avoids duplicating or re-implementing the preprocessing logic.
+`PI05Pytorch` is the bare `nn.Module` core; it is reached via `self.model` as usual.
+
+### Mask convention
+
+`prefix_mask` follows the **True = valid** convention (same as the JAX reference and
+`RLTokenEncoder`'s expected input).  The `img_mask` tensors from lerobot can be 1-D
+`[B]` (single frame) or 2-D `[B, T]` (MEM video); the implementation takes the last
+frame's mask in the video case, consistent with `embed_prefix()` in the parent.
+
+### Design choices vs openpi-RLT
+
+| Aspect | openpi-RLT | lerobot-RLT |
+|--------|-----------|-------------|
+| Hook point | `PaliGemmaWithExpertModel.forward` with `prefix_only=True` flag | Direct call to `PI05Pytorch._embed_images` (no flag added to parent) |
+| Language token inclusion | Always included in VLA prefix | Optional via `image_only` param; default True |
+| Gradient flow | JAX `stop_gradient` on prefix before RLT loss | `torch.no_grad()` in second pass; caller also calls `.detach()` as a safety net |
+| Class registration | Not a draccus policy; used as sub-module | Same — `PI05RLT` is not `@PreTrainedConfig.register_subclass`-registered |
+
+---
+
+## Step 4 — `policies/rltoken/modeling_rltoken.py`
+
+**File:** [src/lerobot/policies/rltoken/modeling_rltoken.py](src/lerobot/policies/rltoken/modeling_rltoken.py)
+
+### Purpose
+
+The **Stage 1 trainable policy**.  Wraps two sub-modules:
+
+| Attribute | Type | Role |
+|-----------|------|------|
+| `self.vla` | `PI05RLT` | VLA backbone; frozen or jointly fine-tuned |
+| `self.rlt_model` | `RLTokenModel` | RLToken encoder + decoder |
+
+At inference time the same policy is used by Machine A:
+- `encode(batch)` → `z_rl [B, num_rl_tokens, embed_dim]`
+- `predict_action_chunk(batch)` → `ref_chunk [B, action_horizon, action_dim]`
+
+### Public API
+
+#### `__init__(config: RLTokenPolicyConfig)`
+
+1. Builds `RLTokenConfig` (plain frozen dataclass) from `config` fields and creates `RLTokenModel`.
+2. Loads or constructs `PI05RLT`:
+   - `config.pi05_pretrained_path` non-empty → `PI05RLT.from_pretrained(path)` (handles openpi key-remapping).
+   - Empty path → `PI05RLT(_build_pi05_config(config))` (fresh init; for tests / ablations).
+3. If `config.alpha == 0.0` calls `_freeze_vla()`.
+
+#### `forward(batch) -> (loss, log_dict)`  *(Stage 1 training)*
+
+| `alpha` | Code path |
+|---------|-----------|
+| `0.0` | `no_grad` prefix extraction → `rlt_model.loss` → return `rlt_loss` |
+| `> 0` | `vla.compute_loss_with_prefix` → `rlt_model.loss` → return `rlt_loss + α*vla_loss` |
+
+`rlt_model.loss` calls `.detach()` internally, so no VLA gradient flows via the RLT reconstruction path regardless of `alpha`.
+
+#### `encode(batch) -> Tensor`
+
+Calls `vla.extract_prefix_embeddings` then `rlt_model.encode`; wrapped in `torch.no_grad`.
+Returns `[B, num_rl_tokens, embed_dim]`.  The serving script flattens to `[B, z_dim]`.
+
+#### `predict_action_chunk(batch) -> Tensor`
+
+Delegates to `self.vla.predict_action_chunk` (full VLA flow-matching inference).
+Returns `[B, action_horizon, action_dim]`; the serving script slices to `chunk_len` steps.
+
+#### `select_action(batch) -> Tensor` / `reset()`
+
+Both delegate to `self.vla` so that the VLA's action queue and episode-boundary bookkeeping
+are used.  lerobot's `drop_queued_actions` should call `self.vla.reset()` if invoked.
+
+#### `freeze_vla()` / `unfreeze_vla()`
+
+Public helpers called by `train_rlt.py` for curriculum-style training schedules (e.g., start
+with VLA frozen, then unfreeze for fine-tuning after a threshold).
+
+### Helper: `_build_pi05_config`
+
+When `pi05_pretrained_path` is empty, this helper derives a `PI05Config` from
+`RLTokenPolicyConfig` fields:
+
+| PI05Config field | Source |
+|-----------------|--------|
+| `chunk_size` | `config.action_horizon` |
+| `n_action_steps` | `config.action_horizon` |
+| `max_state_dim` | `max(config.action_dim, 32)` (pi0.5 pads to ≥32) |
+| `max_action_dim` | same |
+| `image_resolution` | `config.image_resolution` |
+| `input_features` | copied from `config.input_features` |
+| `output_features` | copied from `config.output_features` |
+
+### Checkpoint round-trip
+
+`save_pretrained` (inherited from `PreTrainedPolicy`) serialises all parameters under
+their natural keys: `vla.*` (VLA weights) and `rlt_model.*` (RLToken weights).  When a
+`RLTokenPolicy` checkpoint is loaded via `from_pretrained`, the VLA is first
+constructed (possibly from scratch if `pi05_pretrained_path` is empty), then all
+parameters are overwritten by the saved state dict in one `load_state_dict` call.
+
+### Design choices vs openpi-RLT
+
+| Aspect | openpi-RLT | lerobot-RLT |
+|--------|-----------|-------------|
+| Policy container | No `PreTrainedPolicy` — loose JAX functions | `PreTrainedPolicy` subclass; Hub-compatible |
+| VLA loading | JAX parameter restore | `PI05RLT.from_pretrained()` with key remapping |
+| Gradient gating | `jax.lax.stop_gradient` inside loss fn | `torch.no_grad()` + `rlt_model.loss` internal `.detach()` |
+| Action serving | Separate `serve.py` functions | `encode()` + `predict_action_chunk()` on the same policy object |
+| `select_action` | Not applicable (online RL only) | Delegates to VLA for offline-eval compatibility |
+
+---
+
+## Step 4 — `scripts/train_rlt.py`
+
+**File:** [scripts/train_rlt.py](scripts/train_rlt.py)
+
+### Purpose
+
+Standalone Stage 1 training entry point.  Orchestrates dataset loading,
+policy construction, optimizer / scheduler creation, and the training loop.
+Intentionally simpler than `lerobot-train` (no distributed, no EMA, no
+PEFT, no env eval) — Stage 1 only needs a standard single-GPU SGD loop.
+
+### Config: `RLTTrainConfig`
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `policy` | `RLTokenPolicyConfig` | defaults | Full policy config |
+| `dataset` | `DatasetConfig` | `repo_id=""` | LeRobot dataset |
+| `steps` | `int` | 5 000 | Total training steps |
+| `batch_size` | `int` | 32 | |
+| `num_workers` | `int` | 4 | DataLoader workers |
+| `seed` | `int` | 42 | |
+| `log_every_n_steps` | `int` | 100 | Console + JSONL log interval |
+| `save_every_n_steps` | `int` | 1 000 | `policy.save_pretrained` interval |
+| `output_dir` | `str` | `"./runs/rlt_stage1"` | |
+| `wandb` | `WandBConfig` | disabled | Optional W&B logging |
+
+Parsed by `draccus.wrap()` — supports both `--key=value` CLI flags and
+a `--config path/to/stage1.yaml` config file.
+
+### Key steps inside `train(cfg)`
+
+1. **Feature resolution** — `_resolve_policy_features(policy_cfg, ds_meta)` calls
+   `dataset_to_policy_features(ds_meta.features)` to populate
+   `input_features` and `output_features` on the policy config.  This replicates
+   the feature-injection logic from `make_policy` without requiring a registered
+   factory for `"rltoken"`.
+
+2. **Delta-timestamps** — `resolve_delta_timestamps(policy_cfg, ds_meta)` converts
+   `RLTokenPolicyConfig.action_delta_indices = range(action_horizon)` to float
+   offsets at dataset FPS.  This ensures the dataloader loads a full `action_horizon`-
+   step action chunk per sample.
+
+3. **Preprocessor** — `make_pre_post_processors(policy.vla.config, ds_meta)` reuses
+   the pi05 processor (text tokenisation + state/action normalisation) since
+   `RLTokenPolicy` does not yet have its own registered processor.  Applies to every
+   batch before calling `policy.forward`.
+
+4. **Optimizer / scheduler** — built from `policy_cfg.get_optimizer_preset()` and
+   `get_scheduler_preset()` (AdamW + cosine decay with warmup) over trainable params
+   only.  When `alpha=0`, only `rlt_model.*` parameters have `requires_grad=True`.
+
+5. **Training loop** — standard: forward → backward → grad-clip → optimizer step.
+   `torch.nn.utils.clip_grad_norm_` uses `optimizer_grad_clip_norm` from the policy config.
+
+6. **Checkpointing** — `policy.save_pretrained(ckpt_dir)` every `save_every_n_steps`.
+   Saves both VLA weights and RLToken weights in a Hub-compatible safetensors layout.
+
+7. **Logging** — console + `train_log.jsonl` (one record per `log_every_n_steps`);
+   optional W&B via `cfg.wandb.enable=true`.
+
+### Outputs
+
+```
+output_dir/
+├── train_log.jsonl
+├── checkpoint_001000/
+│   ├── config.json          # RLTokenPolicyConfig
+│   └── model.safetensors    # vla.* + rlt_model.* weights
+├── checkpoint_002000/
+│   └── ...
+└── checkpoint_005000/
+```
+
+### Design choices vs openpi-RLT
+
+| Aspect | openpi-RLT | lerobot-RLT |
+|--------|-----------|-------------|
+| Config system | Python dicts + Gin | draccus dataclass + YAML |
+| Dataset | Custom TFRecord loader | `LeRobotDataset` with `delta_timestamps` |
+| Preprocessor | Inline JAX transforms | lerobot `PolicyProcessorPipeline` (pi05) |
+| Checkpointing | Orbax checkpoint | `PreTrainedPolicy.save_pretrained` (safetensors) |
+| W&B | Built-in | Optional `WandBConfig.enable=true` |
+| Distributed | JAX pmap | Not required for Stage 1; add `accelerate` if needed |
 
 ---
