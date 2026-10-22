@@ -15,18 +15,18 @@ Reference source: [openpi-RLT framework](../openpi-RLT/RLToken_Framework.md)
 |------|------|--------|
 | 1 | [`rl/rltoken/transition.py`](#step-1--rlrltokentransitionpy) | Done |
 | 1 | `rl/rltoken/config.py` | Done |
-| 1 | `rl/rltoken/action_representation.py` | Pending |
+| 1 | `rl/rltoken/action_representation.py` | Done |
 | 2 | `policies/rltoken/rl_token.py` | Done |
 | 2 | `policies/rltoken/configuration_rltoken.py` | Done |
 | 3 | `policies/pi05_rlt/modeling_pi05_rlt.py` | Done |
 | 4 | `policies/rltoken/modeling_rltoken.py` | Done |
 | 4 | `scripts/train_rlt.py` | Done |
-| 5 | `rl/rltoken/networks.py` | Pending |
-| 6 | `rl/rltoken/replay.py` | Pending |
-| 7 | `rl/rltoken/trainer.py` | Pending |
-| 8 | `rl/rltoken/inference.py` | Pending |
+| 5 | `rl/rltoken/networks.py` | Done |
+| 6 | `rl/rltoken/replay.py` | Done |
+| 7 | `rl/rltoken/trainer.py` | Done |
+| 8 | `rl/rltoken/inference.py` | Done |
 | 9 | `scripts/serve_rlt_policy.py` | Pending |
-| 10 | `rl/rltoken/rollout.py` | Pending |
+| 10 | `rl/rltoken/rollout.py` | Done |
 | 11 | `scripts/launch_*.py` / YAML configs | Pending |
 | 12 | `configs/.../norm_stats_delta.json` | Pending |
 
@@ -682,5 +682,545 @@ output_dir/
 | Checkpointing | Orbax checkpoint | `PreTrainedPolicy.save_pretrained` (safetensors) |
 | W&B | Built-in | Optional `WandBConfig.enable=true` |
 | Distributed | JAX pmap | Not required for Stage 1; add `accelerate` if needed |
+
+---
+
+## Step 1 — `rl/rltoken/action_representation.py`
+
+**File:** [src/lerobot/rl/rltoken/action_representation.py](src/lerobot/rl/rltoken/action_representation.py)
+
+### Purpose
+
+Translates between the robot's native absolute joint-position space and the
+normalised representation that the RL actor operates in.  Two transforms are
+composed in sequence:
+
+1. **Delta encoding** — subtract the chunk-start joint state (`state0`) from
+   the first `action_dim - 1` joints to produce relative deltas.  The last
+   dim (gripper) is left absolute because its range is semantically different
+   (open/close, not a continuous trajectory).
+2. **Quantile normalisation** — linearly map the delta (or abs) representation
+   to `[-1, 1]` using per-dim `q01` / `q99` statistics loaded from a JSON file.
+
+No lerobot imports except `config.py`; torch is an optional dependency.
+
+### Public API
+
+#### `QuantileStats` (frozen dataclass)
+
+Holds `q01` and `q99` as `[action_dim]` float32 arrays.
+
+#### `_load_quantile_stats(path)`
+
+Loads a `QuantileStats` from JSON.  Accepts two layouts:
+
+| Layout | Key path |
+|--------|----------|
+| openpi-RLT canonical | `payload["norm_stats"]["actions"]["q01/q99"]` |
+| flat (lerobot plan) | `payload["actions"]["q01/q99"]` |
+
+#### `ActionRepresentationAdapter` (frozen dataclass)
+
+| Method | Direction | Notes |
+|--------|-----------|-------|
+| `from_config(rl_config)` | — | Factory; returns `None` if `action_norm_stats_path` is not set |
+| `normalize_chunk(chunk_abs, state0)` | abs → normalised | NumPy; zero rows preserved |
+| `denormalize_to_abs_chunk(chunk_norm, state0)` | normalised → abs | NumPy |
+| `normalize_ref_chunk(ref_chunk_abs, state0)` | abs → normalised | Alias for `normalize_chunk` |
+| `prepare_training_batch(batch_np)` | in-place batch | Normalises `ref_chunk`, `action_chunk`, `next_ref_chunk`; uses `proprio` / `next_proprio` as state0 anchors |
+| `normalize_chunk_torch(chunk_abs, state0)` | abs → normalised | Torch; compatible with batched `[B, chunk_len, action_dim]` |
+| `denormalize_to_abs_chunk_torch(chunk_norm, state0)` | normalised → abs | Torch |
+
+The `_delta_dim` property returns `action_dim - 1` — the number of joints that
+receive delta encoding.  For SO-ARM with `action_dim=6` this is 5 (all joints
+except gripper).
+
+### Normalisation range: `[-1, 1]` not `[0, 1]`
+
+The integration plan spec says to clip to `[0, 1]`.  The openpi-RLT reference
+implementation uses `[-1, 1]` (formula: `(x - q01) / (q99 - q01) * 2 - 1`).
+We follow the reference because:
+
+- The RL actor outputs logits in `[-1, 1]` (tanh-squashed or fixed-std Gaussian
+  centered at zero); matching the normalisation range avoids needing a bias shift
+  in the actor loss.
+- The reference's critic and BC penalty code assume `[-1, 1]` inputs.
+
+### Design choices vs openpi-RLT
+
+| Aspect | openpi-RLT | lerobot-RLT |
+|--------|-----------|-------------|
+| Framework | JAX / `jnp` | NumPy + optional PyTorch |
+| Delta dims | All `action_dim` joints | Only first `action_dim - 1`; gripper absolute |
+| JSON layout | `norm_stats.actions` nested | Both `norm_stats.actions` (openpi) and flat `actions` supported |
+| Factory pattern | `from_config` class method | Same; returns `None` if path is unset |
+| JAX standalone helpers | `jax_quantile_denormalize`, `jax_delta_to_abs_chunk` | Replaced by `_quantile_{normalize,denormalize}_torch` private helpers |
+| Zero-row preservation | `np.where(zero_mask, 0.0, ...)` | Same; mask computed from `chunk_abs` before normalisation |
+| Batch shape | `[..., chunk_len, action_dim]` | Same; `_broadcast_state0` adds dims until ndim matches |
+
+---
+
+## Step 6 — `rl/rltoken/replay.py`
+
+**File:** [src/lerobot/rl/rltoken/replay.py](src/lerobot/rl/rltoken/replay.py)
+
+### Purpose
+
+Three concerns in one file:
+
+1. **Episode → chunk conversion** — two public functions consume a flat list of
+   `EpisodeStepRecord` objects (one per control step) and emit chunk-level
+   `RLTTransition` objects suitable for the replay buffer.
+2. **`RLTReplayBuffer`** — thread-safe CPU ring buffer.  Lazily allocates a dict
+   of pre-shaped numpy arrays on the first `add()` call; supports both uniform
+   and stratified sampling.
+3. **`ReplayManager` / `ReplayClient` / `NullReplayClient`** — the B3 process
+   that owns the buffer, an append-only pickle journal, and a lightweight HTTP
+   service so the learner (B2) and robot PC (B4) can talk to it.
+
+### Public API
+
+#### Episode builders
+
+| Function | Input | Output | Notes |
+|----------|-------|--------|-------|
+| `build_chunk_transitions_from_episode` | `list[EpisodeStepRecord]`, `chunk_len`, `stride`, `allow_partial` | `list[RLTTransition]` | Overlapping sliding window; zero-pads the tail |
+| `build_terminal_aligned_chunk_transition` | same, no stride | `RLTTransition \| None` | Extracts the last `chunk_len` steps; returns `None` if episode too short or not done |
+
+`stride=2` (default) gives ~50% overlap between successive transitions.  The
+terminal-aligned variant guarantees the final reward appears in `rewards[-1]`,
+which matters for TD-target computation.
+
+Both accept `EpisodeStepRecord` objects or plain dicts (for deserialization from
+journal or test fixtures) via `_coerce_step()` which uses duck-typing so that
+cross-module-path imports don't break `isinstance` checks.
+
+#### `RLTReplayBuffer`
+
+| Method | Notes |
+|--------|-------|
+| `add(transition)` | Writes into `storage[position]`, wraps around at capacity |
+| `extend(transitions)` | Calls `add` in a loop |
+| `sample(batch_size)` | Returns `ArrayDict` (copy); raises if empty |
+| `stats()` | Returns capacity/size/position/strategy info |
+
+Storage is lazily initialised on the first `add()`.  Each field is stored as a
+`[capacity, *field_shape]` pre-typed numpy array so sampling is a single index
+gather per field.
+
+**Stratified sampling** draws from four pools:
+
+| Pool | Filter | Target fraction |
+|------|--------|-----------------|
+| Recent online | `collection_phase_id == ONLINE` and `episode_id >= max_ep - window` | `recent_online_ratio` (default 0.4) |
+| Warmup demos | `collection_phase_id == WARMUP` | `warmup_demo_ratio` (default 0.3) |
+| Human intervention | `intervention_flag \| source in {HUMAN, MIXED}` | `human_intervention_ratio` (default 0.2) |
+| Uniform | All indices | remainder |
+
+Each pool is sampled with replacement (`np.random.default_rng.choice`).  If a
+pool is empty the budget falls through to the uniform fallback.
+
+#### `ReplayManager`
+
+Constructor takes a `ReplayConfig` from `config.py`.  Restores the buffer from
+journal on startup before opening the HTTP server.
+
+HTTP routes (pickle over `application/octet-stream`):
+
+| Verb | Path | Action |
+|------|------|--------|
+| GET | `/healthz` | Returns `b"OK"` |
+| GET | `/stats` | Returns JSON stats dict |
+| POST | `/add` | Deserialise one transition, add to buffer + journal |
+| POST | `/extend` | Deserialise `{"transitions": [...]}`, bulk add |
+| POST | `/sample` | Deserialise `{"batch_size": N}`, return sampled `ArrayDict` |
+
+The server runs in `ThreadingHTTPServer` (one thread per request) with a
+`stop_event` argument for clean shutdown in tests.
+
+#### `ReplayClient`
+
+Standard HTTP client using `urllib.request` — no extra dependencies.
+
+| Method | Notes |
+|--------|-------|
+| `add_transition(t)` | Serialises via `to_journal_record()` |
+| `add_transitions(ts)` | Batches into one `/extend` call |
+| `sample_batch(n)` | Returns `ArrayDict` |
+| `healthz()` | Returns bool; never raises |
+| `wait_until_healthy(timeout_sec)` | Polls `/healthz` until ready or timeout |
+
+#### `NullReplayClient`
+
+Drop-in for eval runs.  Discards all writes silently; `healthz()` returns True;
+`sample_batch()` raises to make accidental reads loud.
+
+### Journal format
+
+The journal is an append-only file where each record is written with
+`pickle.dump(transition.to_journal_record(), ...)`.  `to_journal_record()`
+returns the compact `to_numpy()` dict plus the human-readable
+`collection_phase` string (so the journal can be filtered by phase after a
+crash without decoding the `collection_phase_id` integer).
+
+Writes are flushed and fsync'd after each batch so partial writes are
+distinguishable from complete records at restore time (an incomplete pickle
+frame raises `UnpicklingError` or `EOFError`, both caught during restore).
+
+### Design choices vs openpi-RLT
+
+| Aspect | openpi-RLT | lerobot-RLT |
+|--------|-----------|-------------|
+| HTTP transport | `msgpack_numpy` (openpi_client) | `pickle` — no extra dependency; equally efficient for numpy |
+| `ReplayBuffer` constructor | Individual keyword args | Accepts `ReplayConfig` from `config.py` |
+| `EpisodeStepRecord` / `RLTTransition` | Defined inside `replay.py` | Imported from `transition.py` (already extracted in Step 1) |
+| `RawEpisodeTrace` / `RawEpisodeChunk` | Defined in `replay.py` | Not implemented — `rollout.py` produces a flat `list[EpisodeStepRecord]` directly |
+| Duck-type coercion | `isinstance(step, EpisodeStepRecord)` | `_coerce_step()` with `hasattr` fallback to handle cross-path `isinstance` failures |
+| Metrics logging | `runtime_logging.append_jsonl` | Python stdlib `logging.info` (no extra file) |
+| `NullReplayClient` | Present | Same — used by eval rollout |
+
+---
+
+## Step 5 — `rl/rltoken/networks.py`
+
+**File:** [src/lerobot/rl/rltoken/networks.py](src/lerobot/rl/rltoken/networks.py)
+
+### Purpose
+
+PyTorch port of the JAX actor-critic networks from `openpi-RLT/rlt_online_rl/networks.py`.
+Three `nn.Module` classes, two loss functions, and one TD-target helper — everything
+needed by `trainer.py` to run the B2 learner loop.
+
+### Architecture
+
+#### Feature encoding (shared by actor and critic)
+
+```
+z_rl     [B, z_dim]            →  Linear(z_dim, 256)  →  LN(no affine)            →  z_feat    [B, 256]
+proprio  [B, proprio_dim]      →  Linear(P, 64)       →  tanh(LN(no affine))      →  p_feat    [B, 64]
+ref/act  [B, chunk_len*A]      →  Linear(C*A, 256)    →  tanh(LN(no affine))      →  r_feat    [B, 256]
+                                                                    concat → [B, 576]
+                                                                        ↓
+                                                              Trunk MLP (hidden_dim×num_layers)
+                                                              each hidden: Linear → LN → GELU
+                                                              output: Linear (no activation)
+```
+
+The z_feat has LayerNorm but **no tanh** — matching the reference where z_rl is
+normalized but not squashed.  proprio and ref/action features are tanh-squashed after
+LayerNorm.
+
+#### `ChunkActor`
+
+Outputs action mean `[B, chunk_len, action_dim]`.
+
+| Method | Notes |
+|--------|-------|
+| `forward(z_rl, proprio, ref_chunk)` | Returns mean chunk |
+| `sample(z_rl, proprio, ref_chunk, deterministic)` | Returns `(chunk, log_prob_sum)` |
+| `apply_reference_dropout(ref_chunk, prob)` | Zero whole-chunk per-element; only active in `training=True` mode |
+
+`fixed_std` is registered as a `buffer` (not a trainable parameter) so it
+moves with `.to(device/dtype)`.  Log-prob is summed over all `chunk_len ×
+action_dim` dimensions.
+
+#### `QNetwork`
+
+Same projection structure as `ChunkActor` but uses `action_chunk` (not
+`ref_chunk`) and outputs a scalar Q-value per batch element `[B]`.
+
+#### `TwinCritic`
+
+Owns `q1` and `q2` (`QNetwork` instances).  Exposes `q_values(...)→(q1,q2)`
+and `min_q(...)`.
+
+### Loss functions
+
+#### `build_td_target` (`@torch.no_grad()`)
+
+```
+td_target = Σ_t r_t * γ^t  +  (1 - done) * γ^T * min(q1', q2')
+```
+
+where `T = chunk_len`.  The target actor is called **stochastically** (matching
+the reference; `deterministic=False`).  Since `fixed_std=0.002` the noise is
+negligible in practice.
+
+#### `compute_critic_loss`
+
+```
+loss = MSE(q1, td_target) + MSE(q2, td_target)
+```
+
+#### `compute_actor_loss`
+
+```
+loss = bc_weight * BC_penalty  +  q_weight * (-mean(q1))
+```
+
+**Source-aware BC target** (lerobot-RLT addition):
+
+| `source_chunk` value | BC target |
+|----------------------|-----------|
+| `HUMAN` or `MIXED` | `action_chunk` (human demonstration) |
+| `BASE` or `RL` | `ref_chunk` (VLA reference) |
+
+The mask is computed per-step: `human_mask [B, chunk_len, 1]` blends the two targets.
+
+Reference dropout (`apply_reference_dropout`) is applied to `ref_chunk` before the
+actor forward pass.  The critic Q-evaluation always uses the clean `ref_chunk`.
+
+#### `apply_reference_dropout` (standalone)
+
+Same as the member method but without the `self.training` gate — for use from
+`inference.py` where the actor is in eval mode but dropout is still needed for
+exploration.
+
+### Design choices vs openpi-RLT
+
+| Aspect | openpi-RLT | lerobot-RLT |
+|--------|-----------|-------------|
+| Framework | JAX functional (stateless params dict) | PyTorch `nn.Module` |
+| LayerNorm | Manual `_layer_norm` (no affine) | `nn.LayerNorm(elementwise_affine=False, eps=1e-6)` |
+| Fixed std | Float field on frozen dataclass | `register_buffer('fixed_std', ...)` |
+| Actor loss | `-mean(q1) + beta * MSE(action, ref)` | Same + **source-aware BC target** (HUMAN steps use action_chunk) |
+| Delta smoothness penalty | Not in `networks.py`; in `trainer.py` | Same — deferred to `trainer.py` where adapter can convert to absolute space |
+| `compute_actor_loss` signature | Returns `(loss, metrics)` | Same |
+| TD target actor | Stochastic (`deterministic=False`) | Same (plan incorrectly said `deterministic=True`; reference wins) |
+| Standalone `apply_reference_dropout` | Module-level function | Added — needed for eval-mode inference in `inference.py` |
+
+---
+
+## Step 7 — `rl/rltoken/trainer.py`
+
+**File:** [src/lerobot/rl/rltoken/trainer.py](src/lerobot/rl/rltoken/trainer.py)
+
+### Purpose
+
+The B2 (Learner) process: samples batches from the replay buffer, updates the
+actor-critic, exports actor snapshots for B1 to hot-swap, and checkpoints the
+full training state periodically.  The PyTorch port of the JAX/Flax
+`LearnerService` in openpi-RLT.
+
+### Public API
+
+- `RLTTrainState` — mutable dataclass: `actor`, `target_actor`, `critic`, `target_critic`, `actor_optimizer`, `critic_optimizer`, `global_step`, `actor_version`.
+- `init_train_state(config)` — builds both network pairs (target = `deepcopy`) with Adam optimizers; target networks are `eval()` and have `requires_grad=False`.
+- `polyak_update(source, target, tau)` — in-place EMA: `p_t = (1-τ)p_t + τ·p_s`.
+- `LearnerService` — full training shell with budget pacing, checkpoint save/restore, and snapshot export.
+
+### Key design choices
+
+#### Budget-based pacing (warmup latch)
+
+Mirrors the JAX reference exactly.  When `replay_size` first reaches
+`warmup_min_size`, `_warmup_ready_adds_total` is latched.  From that point:
+
+```
+warmup_required = warmup_post_collect_updates   (or adds_at_latch * G)
+desired_total   = warmup_required + max(adds_total - adds_at_latch, 0) * G
+pending_budget  = max(desired_total - global_step, 0)
+```
+
+`G = grad_updates_per_cycle`.  If `pending_budget <= 0` the learner skips a
+step and sleeps `poll_interval_sec`.  This keeps the update-to-data ratio
+constant as the robot collects new transitions.
+
+#### Critic-first, actor every `actor_update_period` steps
+
+Critic is updated every step.  Actor is updated only on steps where
+`(global_step + 1) % actor_update_period == 0` (matches reference).
+After each actor update, both target networks receive a Polyak update and
+`actor_version` is incremented.
+
+#### Source-aware BC target (inline in `LearnerService._train_step_actor`)
+
+Rather than calling `networks.compute_actor_loss()` (which does the same
+thing but can't reach the adapter for the delta penalty), the actor loss is
+computed inline:
+
+```
+human_mask   = (source_chunk == HUMAN) | (source_chunk == MIXED)  → [B, T, 1]
+bc_target    = human_mask * action_chunk + (1 - human_mask) * ref_chunk
+bc_penalty   = MSE(sampled_chunk, bc_target)
+q_loss       = -mean(q1)
+delta_penalty = MSE(Δ_pred_abs[:, 1:], Δ_bc_abs[:, 1:])  (first delta_dim joints)
+actor_loss   = bc_w * bc + q_w * q + δ_w * delta
+```
+
+#### Delta penalty in absolute space
+
+Because the actor operates in normalized delta space, jerk smoothness must be
+measured after denormalization.  `adapter.denormalize_to_abs_chunk_torch()` is
+called for both `sampled_chunk` and `bc_target`; consecutive-step differences
+along the first `action_dim - 1` joints are compared with MSE.  The penalty is
+skipped when `delta_weight == 0` or `adapter is None`.
+
+#### Atomic writes
+
+`learner_status.json` — polled by `rollout.py` — is written with tmp+rename
+via `_atomic_write_json()`.  Checkpoints and actor snapshots use
+`_atomic_write_pickle()` for the same reason.
+
+### Deviations from JAX reference
+
+| Topic | Reference (JAX) | lerobot-RLT (PyTorch) |
+|-------|-----------------|----------------------|
+| State representation | Flax `TrainState` struct | Plain Python dataclass; optimizers are first-class fields |
+| JIT compilation | `jax.jit(train_step)` | PyTorch eager; no explicit JIT needed for single-GPU |
+| Functional update | Returns new params dict | In-place `optimizer.step()` on `nn.Module` parameters |
+| Actor loss function | `update_actor()` standalone fn | Inline in `LearnerService.train_once()` to share adapter |
+| Delta penalty | Separate `bc_ref_penalty` / `bc_human_penalty` metrics | Combined `delta_penalty` metric |
+| Checkpoint format | Orbax serialization | `pickle` with `state_dict()` for each module |
+| Status file | Same `learner_status.json` layout | Identical; field names preserved for `rollout.py` compatibility |
+
+---
+
+## Step 8 — `rl/rltoken/inference.py`
+
+**File:** [src/lerobot/rl/rltoken/inference.py](src/lerobot/rl/rltoken/inference.py)
+
+### Purpose
+
+The B1 (Actor Service) process: serves `ChunkActor` inference over HTTP
+(pickle transport), polls the snapshot file written by B2 for hot-param
+reload, and provides `MachineAFeatureClient` for the B4 rollout process to
+fetch `z_rl` / `ref_chunk` features over WebSocket.
+
+### Public API
+
+- `ActorRequest` / `ActorResponse` / `RefinementResult` — `slots=True` dataclasses for typed transport.
+- `ActorService` — HTTP inference server + background snapshot poller.  Thread-safe via a single `threading.Lock` protecting all actor weight access.
+- `ActorClient` — HTTP client; pickle transport; `infer()`, `get_version()`, `healthz()`, `wait_until_healthy()`.
+- `maybe_refine_chunk()` — convenience wrapper returning `RefinementResult`; falls back to `BASE` (returns `ref_chunk` unchanged) on error when `on_error_fallback=True`.
+- `MachineAFeatureClient` — WebSocket client using `websockets.sync.client`; pickle payloads; `get_features()` / `get_features_batch()`; auto-reconnect on failure.
+
+### Key design choices
+
+#### Snapshot hot-reload without downtime
+
+A background daemon thread (`_poll_snapshot_loop`) calls `_try_reload_snapshot()`
+every `pull_params_interval_sec`.  The double-checked locking pattern is used:
+version check outside the lock (cheap), full `load_state_dict` + warmup inside
+the lock (safe).  This means `infer()` is never blocked by a stale-version
+check, only by the brief window of a genuine weight swap.
+
+#### Fallback to `ref_chunk` before first snapshot
+
+Until the first snapshot arrives, `_params_loaded = False` and `infer()`
+returns the `ref_chunk` directly with `source=BASE`.  This lets B4 start
+collecting warmup data before B2 has produced a trained actor.
+
+#### Normalize / denormalize split across the lock
+
+`adapter.normalize_ref_chunk()` (adapter is frozen/immutable) runs *before*
+acquiring the lock; `adapter.denormalize_to_abs_chunk()` runs *after* releasing
+it.  The PyTorch forward pass runs *inside* the lock under `torch.no_grad()`.
+This minimises contention while keeping weight access serialized.
+
+#### MachineAFeatureClient reconnect strategy
+
+On send/recv failure the client calls `_reconnect()` which:
+1. Closes the current socket.
+2. Polls the HTTP `/healthz` endpoint until it returns 200.
+3. Opens a fresh WebSocket and waits for the metadata handshake packet.
+
+`_infer()` retries once after reconnect before raising, so transient
+disconnects are transparent to the caller.
+
+#### Batch feature requests
+
+`get_features_batch()` sends `{"batch": [obs, ...]}` and expects
+`{"batch_results": [...]}`.  If the server returns an unexpected shape or the
+request raises, it falls back silently to sequential `get_features()` calls.
+This keeps the rollout loop running even against a server that only supports
+single requests.
+
+### Deviations from JAX reference
+
+| Topic | Reference (JAX) | lerobot-RLT (PyTorch) |
+|-------|-----------------|----------------------|
+| Transport | `msgpack_numpy` (HTTP) | `pickle` — msgpack_numpy not installed |
+| WebSocket payload | `msgpack_numpy` | `pickle` |
+| Actor forward | Stateless JAX `apply(params, ...)` | `nn.Module` with `load_state_dict()` |
+| `EnvDriver` | Complex class with `RawEpisodeTrace`, prefetch queue | Not in `inference.py`; lives in `rollout.py` |
+| `ActorService` HTTP server | Flask-style routing | `ThreadingHTTPServer` from stdlib |
+| Warmup on load | Full model warmup with JAX tracing | One dummy `actor.sample()` call under `torch.no_grad()` |
+
+---
+
+## Step 10 — `rl/rltoken/rollout.py`
+
+**File:** [src/lerobot/rl/rltoken/rollout.py](src/lerobot/rl/rltoken/rollout.py)
+
+### Purpose
+
+SO-ARM-specific rollout logic.  Wraps `SOFollower`/`ThreadSafeRobot` into a chunk-level executor, drives the Machine A → Actor → robot execution loop, and pushes `RLTTransition` objects to the replay buffer at episode end.  No JAX dependency.
+
+### Public API
+
+- `StepResult` — per-step result from `SOArmEnv.execute_chunk()`.
+- `SOArmEnv` — rate-controlled hardware layer; `obs_to_state()`, `reset()`, `execute_chunk()`.
+- `ChunkFeatures` — holds `(z_rl, proprio, ref_chunk)` returned by Machine A for one chunk.
+- `RolloutPhaseController` — polls `learner_status.json` to implement warmup → online transition.
+- `KeyboardSignalBridge` — non-blocking pynput keyboard queue; falls back to no-op if pynput absent.
+- `EnvDriver` — single-episode orchestrator with two-pass `EpisodeStepRecord` construction.
+- `RolloutOrchestrator` — top-level episode loop; wires all components together.
+- Signal constants: `SIG_NEXT_EPISODE`, `SIG_MARK_SUCCESS`, `SIG_MARK_FAILURE`, `SIG_SET_ACTOR_MODE`, `SIG_SET_BASE_MODE`, `SIG_TOGGLE_TELEOP`, `SIG_QUIT`.
+
+### Key design choices
+
+#### Two-pass `EpisodeStepRecord` construction
+
+`next_z_rl` for step k cannot be known during chunk k execution because Machine A
+is only queried at chunk boundaries.  The episode loop therefore:
+1. Collects `(step_results, features, source, actor_version)` per chunk in a list.
+2. After the loop, queries Machine A once more on the terminal observation to get `z_rl_terminal`.
+3. In a post-processing pass, assigns `next_z_rl = features_{k+1}.z_rl` for all steps in chunk k (or `z_rl_terminal` for the last chunk).
+
+This is a clean approximation: `z_rl` changes slowly, and using the chunk-start
+value for all steps within that chunk introduces negligible bias.
+
+#### Rate control in `execute_chunk`
+
+Uses `time.monotonic()` + `time.sleep(remaining)` per step rather than an
+absolute wall-clock schedule.  This avoids cumulative drift when `send_action`
+takes variable time, but doesn't compensate if a single step overshoots the
+budget.
+
+#### Phase controller and learner_status.json
+
+`RolloutPhaseController` reads `{run_dir}/metrics/learner_status.json` (written
+atomically by `LearnerService._write_status()`).  It caches the result for
+`poll_interval_sec` to avoid hammering the filesystem, and falls back to
+`"warmup"` on any read error.  The `ready_for_online` boolean field is the sole
+gate for transitioning to the `"online"` phase.
+
+#### Keyboard signal handling
+
+The `done_signal` callback passed to `run_episode()` is a closure that reads
+from `KeyboardSignalBridge.get_signal()` once per chunk.  Only stop signals
+(`SIG_NEXT_EPISODE`, `SIG_MARK_SUCCESS`, `SIG_MARK_FAILURE`, `SIG_QUIT`)
+terminate the episode.  Mode-override signals (`SIG_SET_ACTOR_MODE`,
+`SIG_SET_BASE_MODE`) are consumed by `RolloutOrchestrator.run_forever()` before
+and after each episode.
+
+#### `EnvDriver` is stateless across episodes
+
+`EnvDriver` has no per-episode mutable state; everything is local to
+`run_episode()`.  This makes it safe to call repeatedly without restarting the
+process.
+
+### Deviations from reference (openpi-RLT `inference.py` + `rollout`)
+
+| Topic | Reference (JAX) | lerobot-RLT (PyTorch) |
+|-------|-----------------|----------------------|
+| Episode trace structure | `RawEpisodeTrace` with separate obs, steps, chunks lists | Flat `list[EpisodeStepRecord]` — simpler, no backfill queue |
+| Feature backfill | Batch Machine A query at episode end for all intermediate obs | Not needed: z_rl assigned per-chunk, not per-step |
+| Transition stride | `stride=2` sliding window | `stride=chunk_len` (non-overlapping) — one transition per chunk executed |
+| Env interface | Protocol-based `env.reset()`, `execute_chunk()`, `current_phase_name()` | Concrete `SOArmEnv` with `ThreadSafeRobot`; phase owned by `RolloutPhaseController` |
+| Human override | `human_override_fn` callback injected at `EnvDriver` level | Not implemented; operator signals `SIG_MARK_SUCCESS/FAILURE` to end episode |
+| raw episode pickle | Persists `RawEpisodeTrace` to disk for post-hoc analysis | Not implemented in this version |
+| Keyboard | pynput via `EnvDriver` | Owned by `RolloutOrchestrator`; `EnvDriver` receives a `done_signal` callable |
 
 ---
