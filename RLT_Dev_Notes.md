@@ -25,10 +25,10 @@ Reference source: [openpi-RLT framework](../openpi-RLT/RLToken_Framework.md)
 | 6 | `rl/rltoken/replay.py` | Done |
 | 7 | `rl/rltoken/trainer.py` | Done |
 | 8 | `rl/rltoken/inference.py` | Done |
-| 9 | `scripts/serve_rlt_policy.py` | Pending |
+| 9 | `scripts/serve_rlt_policy.py` | Done |
 | 10 | `rl/rltoken/rollout.py` | Done |
-| 11 | `scripts/launch_*.py` / YAML configs | Pending |
-| 12 | `configs/.../norm_stats_delta.json` | Pending |
+| 11 | `scripts/launch_*.py` / `scripts/run_rlt_role.py` | Done |
+| 12 | `configs/rltoken/base.yaml` / `online_rl.yaml` / `norm_stats_delta.json` | Done |
 
 ---
 
@@ -1224,3 +1224,170 @@ process.
 | Keyboard | pynput via `EnvDriver` | Owned by `RolloutOrchestrator`; `EnvDriver` receives a `done_signal` callable |
 
 ---
+
+## Step 9 — `scripts/serve_rlt_policy.py`
+
+**File:** [src/lerobot/scripts/serve_rlt_policy.py](src/lerobot/scripts/serve_rlt_policy.py)
+
+### Purpose
+
+Machine A WebSocket server.  Loads a trained `RLTokenPolicy` checkpoint and
+serves VLA features (`z_rl`, `ref_chunk`, `proprio`) to the robot rollout
+process (`MachineAFeatureClient` in `inference.py`) over WebSocket.
+
+### Protocol
+
+All messages use **pickle** (consistent with the rest of the pipeline; no
+msgpack_numpy dependency).
+
+On connect the server sends a metadata handshake packet:
+```python
+{"z_dim": int, "chunk_len": int, "action_dim": int, "proprio_dim": int,
+ "device": str, "supports_batch": True}
+```
+
+Single-observation request/response:
+```
+→ {"images": {cam_key: HxWxC uint8 numpy}, "state": [state_dim,], "prompt": str}
+← {"z_rl": [z_dim,], "ref_chunk": [chunk_len, action_dim], "proprio": [proprio_dim,], "infer_ms": float}
+```
+
+Batch request/response:
+```
+→ {"batch": [obs1, obs2, ...]}
+← {"batch_results": [res1, res2, ...], "batch_size": N}
+```
+
+### Key design choices
+
+**Two-call forward pass** — `_forward_once()` calls `policy.encode()` (vision
+encoder → z_rl) and `policy.predict_action_chunk()` (full VLA flow matching →
+ref_chunk) separately.  Each call internally runs `extract_prefix_embeddings()`,
+so the prefix extraction happens twice per observation.  This is intentional:
+it avoids coupling the two model entry points and keeps the serve script simple.
+A shared-prefix optimisation can be added later if latency becomes a bottleneck.
+
+**Image preprocessing** — images arriving as `HxWxC uint8` are converted to
+`[1, C, H, W] float32 [0, 1]` and stored under `observation.images.{cam_key}`.
+The policy's internal preprocessing (PI05/PaliGemma normalisation) is applied
+inside `policy.encode()` / `policy.predict_action_chunk()`.
+
+**HTTP healthz sidecar** — a `ThreadingHTTPServer` running in a daemon thread
+answers `GET /healthz → 200 OK` on the same port as the WebSocket.  This lets
+`MachineAFeatureClient._wait_for_server()` poll HTTP before opening the
+WebSocket.
+
+**Warmup** — one dummy forward pass runs at startup to trigger CUDA graph
+compilation / any JIT overhead before the first real request arrives.
+
+**CLI** — `--checkpoint-path`, `--port`, `--host`, `--chunk-len`, `--action-dim`,
+`--proprio-dim`, `--z-dim`, `--device`.  The default port is 8000.
+
+### Deviations from reference (openpi-RLT `serve_rlt_policy.py`)
+
+| Topic | Reference (JAX) | lerobot-RLT (PyTorch) |
+|-------|-----------------|----------------------|
+| Backend | JAX JIT + TPU/GPU | PyTorch + CUDA |
+| Policy class | `RLTPolicy` (openpi wrapper) | `RLTokenPolicy` |
+| Transport | msgpack via openpi `WebsocketPolicyServer` | pickle over raw websockets |
+| Warmup | JIT compile for each batch size in a set | Single dummy forward pass |
+| Shared prefix | extract_prefix_embeddings cached per request | Not cached (two-call design) |
+| Health check | separate FastAPI `/healthz` process | ThreadingHTTPServer sidecar in same process |
+
+---
+
+## Step 11 — `scripts/launch_*.py` and `scripts/run_rlt_role.py`
+
+**Files:**
+- [src/lerobot/scripts/run_rlt_role.py](src/lerobot/scripts/run_rlt_role.py)
+- [src/lerobot/scripts/launch_machine_b_rlt.py](src/lerobot/scripts/launch_machine_b_rlt.py)
+- [src/lerobot/scripts/launch_robot_rollout_rlt.py](src/lerobot/scripts/launch_robot_rollout_rlt.py)
+- [src/lerobot/scripts/launch_actor_eval_rlt.py](src/lerobot/scripts/launch_actor_eval_rlt.py)
+
+### `run_rlt_role.py` — role dispatcher
+
+A thin subprocess entry point that accepts `--role {replay_manager,
+learner_service, actor_service}` and `--config <yaml>` and starts the
+corresponding service.  Used by `launch_machine_b_rlt.py` (one subprocess per
+role).  Derives `run_dir` from the config's `checkpoint_dir` parent when not
+explicitly passed.
+
+### `launch_machine_b_rlt.py`
+
+Spawns three subprocesses via `run_rlt_role.py`, registers SIGINT/SIGTERM
+handlers, then polls every 1 second.  If any subprocess exits non-zero the
+launcher terminates all siblings and exits 1.  A 5-second grace period after
+spawn avoids false-positive crash detection during service startup.
+
+Optional `--wandb-project` / `--wandb-run-name` arguments look for a
+`_rlt_wandb_monitor.py` sidecar script (not yet implemented; a warning is
+logged if it is absent).
+
+### `launch_robot_rollout_rlt.py`
+
+Before starting `RolloutOrchestrator`, waits for:
+1. `ActorService GET /healthz → 200`
+2. `ReplayManager GET /healthz → 200`
+3. `Machine A GET {http_url}/healthz → 200` (derived from the `ws://` URL)
+
+Timeout defaults to 300 seconds per service.  Pass `--no-wait` to skip all
+checks.  CLI overrides for `--actor-url`, `--replay-url`, `--machine-a-ws-url`
+allow running the robot machine against services on different hosts without
+editing the YAML.
+
+### `launch_actor_eval_rlt.py`
+
+Eval-only mode: starts `ActorService` in a daemon thread (no learner writes
+new snapshots), waits for it to become healthy, then runs
+`RolloutOrchestrator(eval_only=True)`.  Useful for demonstrating a trained
+checkpoint without spinning up Machine B.
+
+Passes `actor_deterministic=True` by default so the actor uses its mean
+action (no exploration noise).
+
+### Deviations from reference
+
+| Topic | Reference (openpi-RLT) | lerobot-RLT |
+|-------|------------------------|-------------|
+| B service spawning | `subprocess.Popen` + multiprocessing monitor | Same pattern |
+| Health wait | `/version` + `/stats` endpoints | `/healthz` on all services |
+| Robot wait | `pika_sync_ros.py` ROS bridge | `RolloutOrchestrator` directly |
+| W&B monitor | Inline metric streaming | Separate sidecar (stub only) |
+
+---
+
+## Step 12 — YAML configs and `norm_stats_delta.json`
+
+**Files:**
+- [configs/rltoken/base.yaml](configs/rltoken/base.yaml)
+- [configs/rltoken/tasks/so_arm_ethernet/online_rl.yaml](configs/rltoken/tasks/so_arm_ethernet/online_rl.yaml)
+- [configs/rltoken/tasks/so_arm_ethernet/stats/norm_stats_delta.json](configs/rltoken/tasks/so_arm_ethernet/stats/norm_stats_delta.json)
+
+### YAML layout
+
+Both files use the `experiment` / `runtime` two-section layout supported by
+`load_system_config_yaml()`.  `base.yaml` lists every field with its default
+value as documentation.  `online_rl.yaml` only overrides what is task-specific
+(paths, IP addresses, SO-ARM dimension values).
+
+### `norm_stats_delta.json`
+
+**Currently a placeholder.**  The file exists so that the config can be parsed
+without errors, but the `q01`/`q99` values are dummy.  **These must be replaced
+with real quantile statistics computed from the demonstration dataset before
+training.**
+
+The intended workflow:
+1. Record SO-ARM demonstrations using the standard lerobot record pipeline.
+2. Run `scripts/compute_delta_norm_stats.py` (to be written) on the resulting
+   `LeRobotDataset` to compute per-dimension 1st/99th percentile of the
+   delta-chunk actions.
+3. Write the output JSON to this path.
+
+The file format matches what `DeltaChunkNormAdapter.from_config()` expects:
+```json
+{"actions": {"q01": [...], "q99": [...]}}
+```
+
+---
+

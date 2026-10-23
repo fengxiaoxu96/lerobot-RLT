@@ -1,0 +1,9 @@
+{
+  "NOTE": "PLACEHOLDER — this file will be replaced with real per-dimension quantile statistics once a demonstration dataset is collected and processed. Run scripts/compute_delta_norm_stats.py on the LeRobotDataset to generate the actual q01/q99 values before training.",
+  "description": "Per-dimension quantile normalisation stats for the delta-chunk action representation on the SO-ARM ethernet-insertion task. Dims 0-4 are chunk-relative joint-angle deltas (degrees). Dim 5 is the absolute gripper position (Feetech raw units, 0-100).",
+  "_actions_placeholder": {
+    "_dim_meaning": ["shoulder_pan_delta", "shoulder_lift_delta", "elbow_flex_delta", "wrist_flex_delta", "wrist_roll_delta", "gripper_abs"],
+    "q01": [-10.0, -10.0, -10.0, -10.0, -10.0, 0.0],
+    "q99": [ 10.0,  10.0,  10.0,  10.0,  10.0, 100.0]
+  }
+}

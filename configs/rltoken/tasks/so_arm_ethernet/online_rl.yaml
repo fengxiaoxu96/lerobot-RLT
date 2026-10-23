@@ -1,0 +1,58 @@
+# SO-ARM ethernet-insertion task — online RL overrides.
+# Inherits all defaults from configs/rltoken/base.yaml; only task-specific
+# values are listed here.
+#
+# Before running:
+#   1. Set machine_a_ws_url to the actual Machine A IP address.
+#   2. Set actor_service_url / replay_service_url if Machine B runs remotely.
+#   3. Replace stats/norm_stats_delta.json with real quantile stats computed
+#      from your demonstration dataset (see docs/rltoken/norm_stats.md).
+
+experiment:
+  rl:
+    action_dim: 6
+    proprio_dim: 6
+    chunk_len: 10
+    fixed_std: 0.002
+    delta_weight: 10.0
+    warmup_min_size: 600
+    warmup_post_collect_updates: 20000
+    action_representation: delta_chunk
+    action_norm_stats_path: "./stats/norm_stats_delta.json"
+
+runtime:
+  actor_service:
+    snapshot_path: "./runs/so_arm_ethernet/actor_snapshot/actor_snapshot.pkl"
+
+  learner_service:
+    checkpoint_dir: "./runs/so_arm_ethernet/checkpoints"
+    actor_snapshot_path: "./runs/so_arm_ethernet/actor_snapshot/actor_snapshot.pkl"
+    sample_batch_size: 128
+    push_actor_interval_steps: 500
+    checkpoint_interval_steps: 1000
+
+  replay:
+    capacity: 200000
+    journal_path: "./runs/so_arm_ethernet/replay/replay_journal.pkl"
+    sample_strategy: stratified
+
+  env_driver:
+    # CHANGE THIS: IP address of the Machine A VLA server
+    machine_a_ws_url: "ws://MACHINE_A_IP:8000"
+    actor_service_url: "http://127.0.0.1:9101"
+    replay_service_url: "http://127.0.0.1:9102"
+    task_mode: critical_phase
+    control_frequency_hz: 20.0
+    chunk_exec_horizon: 10
+    safe_fallback_to_ref: true
+    # SO-ARM reset pose for the critical phase (Feetech raw units, 6 DOF)
+    # Format: [shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper]
+    critical_phase_reset_action: null  # set to e.g. [2048, 2048, 2048, 2048, 2048, 50]
+
+  monitoring:
+    enable_wandb: false
+    wandb_project: rlt-online-rl
+    wandb_run_name: so-arm-ethernet-online-rl
+    wandb_dir: "./runs/so_arm_ethernet/wandb"
+
+  role: all
